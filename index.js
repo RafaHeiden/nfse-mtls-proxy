@@ -6,6 +6,8 @@ const PORT = process.env.PORT || 3000;
 const PROXY_SECRET = process.env.NFSE_PROXY_SECRET;
 
 const server = http.createServer(async (req, res) => {
+    console.log(`[Proxy] ${req.method} ${req.url}`);
+    
     if (req.method !== 'POST') {
         res.writeHead(405, { 'Content-Type': 'text/plain' });
         res.end('Method Not Allowed');
@@ -13,33 +15,35 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.headers['x-proxy-secret'] !== PROXY_SECRET) {
+        console.log('[Proxy] Invalid secret');
         res.writeHead(403, { 'Content-Type': 'text/plain' });
         res.end('Forbidden: Invalid proxy secret');
         return;
     }
 
     let body = '';
-    req.on('data', chunk => {
-        body += chunk.toString();
-    });
+    req.on('data', chunk => { body += chunk.toString(); });
 
     req.on('end', async () => {
         try {
-            const { targetUrl, pfxBase64, pfxPassword, contentType, soapAction, authorization, body: requestBody } = JSON.parse(body);
+            const { targetUrl, pfxBase64, pfxPassword, payload, soapAction, contentType } = JSON.parse(body);
+            console.log(`[Proxy] Connecting to: ${targetUrl}`);
+            console.log(`[Proxy] SOAPAction: ${soapAction}`);
 
+            // Decode PFX
             const pfxDer = forge.util.decode64(pfxBase64);
             const pfxAsn1 = forge.asn1.fromDer(pfxDer);
             const pfx = forge.pkcs12.pkcs12FromAsn1(pfxAsn1, pfxPassword);
 
-            const keyBags = pfx.getBags({ bagType: forge.pki.oids.pkcs8ShroudedKeyBag })[forge.pki.oids.pkcs8ShroudedKeyBag];
-            const certBags = pfx.getBags({ bagType: forge.pki.oids.certBag })[forge.pki.oids.certBag];
+            const keyBags = pfx.getBags({ bagType: '1.2.840.113549.1.12.10.1.2' })['1.2.840.113549.1.12.10.1.2'];
+            const certBags = pfx.getBags({ bagType: '1.2.840.113549.1.12.10.1.3' })['1.2.840.113549.1.12.10.1.3'];
 
-            if (!keyBags || keyBags.length === 0 || !certBags || certBags.length === 0) {
+            if (!keyBags?.length || !certBags?.length) {
                 throw new Error('Could not find key or certificate in PFX');
             }
 
-            const key = keyBags[0].key;
-            const cert = certBags[0].cert;
+            const key = forge.pki.privateKeyToPem(keyBags[0].key);
+            const cert = forge.pki.certificateToPem(certBags[0].cert);
 
             const targetUrlParsed = new URL(targetUrl);
 
@@ -50,33 +54,42 @@ const server = http.createServer(async (req, res) => {
                 method: 'POST',
                 headers: {
                     'Content-Type': contentType || 'text/xml; charset=utf-8',
-                    'SOAPAction': soapAction,
-                    'Authorization': authorization,
-                    'Accept': 'text/xml, application/xml',
+                    'Content-Length': Buffer.byteLength(payload, 'utf8'),
+                    ...(soapAction && { 'SOAPAction': soapAction }),
                 },
-                key: forge.pki.privateKeyToPem(key),
-                cert: forge.pki.certificateToPem(cert),
-                rejectUnauthorized: true,
+                key: key,
+                cert: cert,
+                rejectUnauthorized: false, // SimplISS may have self-signed cert
             };
 
-            console.log(`[Proxy] Connecting to: ${targetUrl}`);
+            console.log('[Proxy] Making mTLS request...');
 
             const proxyReq = https.request(options, (proxyRes) => {
-                res.writeHead(proxyRes.statusCode, { 'Content-Type': proxyRes.headers['content-type'] || 'text/xml' });
-                proxyRes.pipe(res);
+                console.log(`[Proxy] Response status: ${proxyRes.statusCode}`);
+                
+                let responseBody = '';
+                proxyRes.on('data', chunk => { responseBody += chunk; });
+                proxyRes.on('end', () => {
+                    console.log(`[Proxy] Response body (first 500): ${responseBody.substring(0, 500)}`);
+                    res.writeHead(proxyRes.statusCode, {
+                        'Content-Type': proxyRes.headers['content-type'] || 'text/xml',
+                    });
+                    res.end(responseBody);
+                });
             });
 
             proxyReq.on('error', (e) => {
-                console.error('Proxy request error:', e);
+                console.error('[Proxy] Request error:', e.message);
                 res.writeHead(500, { 'Content-Type': 'text/plain' });
-                res.end(`Proxy request failed: ${e.message}`);
+                res.end(`Proxy error: ${e.message}`);
             });
 
-            proxyReq.write(requestBody);
+            // Send SOAP XML directly (not JSON)
+            proxyReq.write(payload);
             proxyReq.end();
 
         } catch (error) {
-            console.error('Error in proxy:', error.message);
+            console.error('[Proxy] Error:', error.message);
             res.writeHead(500, { 'Content-Type': 'text/plain' });
             res.end(`Proxy error: ${error.message}`);
         }
@@ -84,5 +97,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-    console.log(`mTLS Proxy listening on port ${PORT}`);
+    console.log(`[Proxy] mTLS Proxy listening on port ${PORT}`);
 });
