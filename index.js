@@ -21,14 +21,20 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    let body = '';
-    req.on('data', chunk => { body += chunk.toString(); });
+    let requestBody = '';
+    req.on('data', chunk => { requestBody += chunk.toString(); });
 
     req.on('end', async () => {
         try {
-            const { targetUrl, pfxBase64, pfxPassword, payload, soapAction, contentType } = JSON.parse(body);
+            const { targetUrl, pfxBase64, pfxPassword, body, soapAction, contentType, authorization } = JSON.parse(requestBody);
+            
             console.log(`[Proxy] Connecting to: ${targetUrl}`);
             console.log(`[Proxy] SOAPAction: ${soapAction}`);
+            console.log(`[Proxy] Body length: ${body?.length || 0}`);
+
+            if (!body) {
+                throw new Error('Missing body in request');
+            }
 
             // Decode PFX
             const pfxDer = forge.util.decode64(pfxBase64);
@@ -47,19 +53,23 @@ const server = http.createServer(async (req, res) => {
 
             const targetUrlParsed = new URL(targetUrl);
 
+            const headers = {
+                'Content-Type': contentType || 'text/xml; charset=utf-8',
+                'Content-Length': Buffer.byteLength(body, 'utf8'),
+            };
+            
+            if (soapAction) headers['SOAPAction'] = soapAction;
+            if (authorization) headers['Authorization'] = authorization;
+
             const options = {
                 hostname: targetUrlParsed.hostname,
                 port: targetUrlParsed.port || 443,
                 path: targetUrlParsed.pathname + targetUrlParsed.search,
                 method: 'POST',
-                headers: {
-                    'Content-Type': contentType || 'text/xml; charset=utf-8',
-                    'Content-Length': Buffer.byteLength(payload, 'utf8'),
-                    ...(soapAction && { 'SOAPAction': soapAction }),
-                },
+                headers: headers,
                 key: key,
                 cert: cert,
-                rejectUnauthorized: false, // SimplISS may have self-signed cert
+                rejectUnauthorized: false,
             };
 
             console.log('[Proxy] Making mTLS request...');
@@ -70,7 +80,7 @@ const server = http.createServer(async (req, res) => {
                 let responseBody = '';
                 proxyRes.on('data', chunk => { responseBody += chunk; });
                 proxyRes.on('end', () => {
-                    console.log(`[Proxy] Response body (first 500): ${responseBody.substring(0, 500)}`);
+                    console.log(`[Proxy] Response (first 500): ${responseBody.substring(0, 500)}`);
                     res.writeHead(proxyRes.statusCode, {
                         'Content-Type': proxyRes.headers['content-type'] || 'text/xml',
                     });
@@ -84,8 +94,7 @@ const server = http.createServer(async (req, res) => {
                 res.end(`Proxy error: ${e.message}`);
             });
 
-            // Send SOAP XML directly (not JSON)
-            proxyReq.write(payload);
+            proxyReq.write(body);
             proxyReq.end();
 
         } catch (error) {
